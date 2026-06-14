@@ -8,9 +8,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"wirebonding/ultra/internal/canbus"
 	"wirebonding/ultra/internal/iec61850"
 	"wirebonding/ultra/internal/impedance"
 	"wirebonding/ultra/internal/packetcap"
+	"wirebonding/ultra/internal/pullstrength"
 	"wirebonding/ultra/internal/ringbuf"
 	"wirebonding/ultra/pkg/models"
 )
@@ -30,6 +32,9 @@ type Config struct {
 	LogPath       string
 	RingCap       int
 	WorkerCount   int
+	PullRedlineG  float64
+	EnableCANFuse bool
+	CANDeviceID   uint8
 }
 
 func DefaultConfig() Config {
@@ -47,6 +52,9 @@ func DefaultConfig() Config {
 		StatsInterval: 5 * time.Second,
 		RingCap:       65536,
 		WorkerCount:   64,
+		PullRedlineG:  5.0,
+		EnableCANFuse: true,
+		CANDeviceID:   0x01,
 	}
 }
 
@@ -63,6 +71,9 @@ type Stats struct {
 	UptimeNs       uint64
 	RingEnqFails   uint64
 	RingDeqFails   uint64
+	PullPredictions uint64
+	PullRedlineHits uint64
+	CANFuseFrames   uint64
 }
 
 type frameMsg struct {
@@ -81,6 +92,7 @@ type WireBondingGateway struct {
 	capture   *packetcap.PacketCapture
 	decoder   *iec61850.Decoder
 	pipeline  *impedance.Pipeline
+	fuse      *canbus.FuseDispatcher
 
 	frameRing *ringbuf.BatchRingBuffer[frameMsg]
 	sampRing  *ringbuf.BatchRingBuffer[sampleMsg]
@@ -89,6 +101,7 @@ type WireBondingGateway struct {
 	parseBuf  []models.WaveSample
 	frameBuf  []models.PhasorFrame
 	anomBuf   []impedance.AnomalyEvent
+	pullBuf   []pullstrength.PullEvent
 
 	stats     Stats
 	startTime time.Time
@@ -98,6 +111,8 @@ type WireBondingGateway struct {
 
 	anomalyCB func(impedance.AnomalyEvent)
 	frameCB   func(models.PhasorFrame)
+	pullCB    func(pullstrength.PullEvent)
+	canCB     func(canbus.Frame20B)
 }
 
 func NewWireBondingGateway(cfg Config) (*WireBondingGateway, error) {
@@ -111,13 +126,16 @@ func NewWireBondingGateway(cfg Config) (*WireBondingGateway, error) {
 		cfg.BatchSize = 256
 	}
 	if cfg.TargetHz <= 0 {
-		cfg.TargetHz = 60_000.0
+		cfg.TargetHz = 40_000.0
 	}
 	if cfg.RingCap <= 0 {
 		cfg.RingCap = 65536
 	}
 	if cfg.WorkerCount <= 0 {
 		cfg.WorkerCount = 64
+	}
+	if cfg.PullRedlineG <= 0 {
+		cfg.PullRedlineG = 5.0
 	}
 
 	cap, err := packetcap.NewPacketCapture(cfg.InterfaceName, cfg.EtherType, cfg.Promisc, cfg.ZeroCopy)
@@ -131,6 +149,8 @@ func NewWireBondingGateway(cfg Config) (*WireBondingGateway, error) {
 	pipeCfg.TargetHz = cfg.TargetHz
 	pipeCfg.SampleHz = float64(models.SampleRateHz)
 	pipeCfg.MatrixRows = cfg.MatrixRows
+	pipeCfg.PullRedlineG = cfg.PullRedlineG
+	pipeCfg.EnablePullPred = true
 	pipe := impedance.NewPipeline(pipeCfg)
 
 	gw := &WireBondingGateway{
@@ -144,6 +164,16 @@ func NewWireBondingGateway(cfg Config) (*WireBondingGateway, error) {
 		parseBuf:  make([]models.WaveSample, cfg.BatchSize*128),
 		frameBuf:  make([]models.PhasorFrame, cfg.BatchSize*128),
 		anomBuf:   make([]impedance.AnomalyEvent, 128),
+		pullBuf:   make([]pullstrength.PullEvent, 128),
+	}
+
+	if cfg.EnableCANFuse {
+		gw.fuse = canbus.NewFuseDispatcher(func(f canbus.Frame20B) {
+			if gw.canCB != nil {
+				gw.canCB(f)
+			}
+			atomic.AddUint64(&gw.stats.CANFuseFrames, 1)
+		})
 	}
 
 	if cfg.LogPath != "" {
@@ -169,6 +199,18 @@ func (gw *WireBondingGateway) OnFrame(cb func(models.PhasorFrame)) {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
 	gw.frameCB = cb
+}
+
+func (gw *WireBondingGateway) OnPullEvent(cb func(pullstrength.PullEvent)) {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	gw.pullCB = cb
+}
+
+func (gw *WireBondingGateway) OnCANFrame(cb func(canbus.Frame20B)) {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	gw.canCB = cb
 }
 
 func (gw *WireBondingGateway) Start(ctx context.Context) error {
@@ -280,7 +322,7 @@ func (gw *WireBondingGateway) dspLoop(ctx context.Context, errChan chan<- error)
 		}
 
 		dsStart := time.Now()
-		fc, ac := gw.pipeline.ProcessBatch(workBuf, gw.frameBuf, gw.anomBuf)
+		fc, ac, pc := gw.pipeline.ProcessBatch(workBuf, gw.frameBuf, gw.anomBuf, gw.pullBuf)
 		dsLatency := time.Since(dsStart)
 
 		if fc > 0 {
@@ -302,6 +344,36 @@ func (gw *WireBondingGateway) dspLoop(ctx context.Context, errChan chan<- error)
 				}
 			}
 		}
+		if pc > 0 {
+			atomic.AddUint64(&gw.stats.PullRedlineHits, uint64(pc))
+			for i := 0; i < pc; i++ {
+				evt := gw.pullBuf[i]
+				gw.logger.Printf("PULL-REDLINE id=%d seq=%d pull=%.3fg shear=%.3fg conf=%.2f%% soft=%.2f%%",
+					evt.EventID, evt.Prediction.SeqNo,
+					evt.Prediction.PullGrams, evt.Prediction.ShearGrams,
+					evt.Prediction.Confidence*100,
+					evt.Prediction.Features.SofteningDeg*100)
+				if gw.pullCB != nil {
+					gw.pullCB(evt)
+				}
+				if gw.fuse != nil {
+					bondID := uint16(evt.Prediction.SeqNo & 0xFFFF)
+					reason := uint8(canbus.ReasonPullStrengthBelowRedline)
+					pg := float32(evt.Prediction.PullGrams)
+					dp := float32(0)
+					if evt.Prediction.PullGrams > 1e-9 {
+						dp = float32((evt.Prediction.PullGrams - gw.cfg.PullRedlineG) /
+							evt.Prediction.PullGrams * 100.0)
+					}
+					gw.fuse.DispatchEmergency(bondID, reason, pg, dp,
+						uint32(evt.Prediction.SeqNo), evt.Prediction.TimestampNs,
+						gw.cfg.CANDeviceID)
+				}
+			}
+		}
+
+		predTot := gw.pipeline.PullTotal()
+		atomic.StoreUint64(&gw.stats.PullPredictions, predTot)
 
 		totalLatencyNs := uint64(dsLatency.Nanoseconds())
 		atomic.AddUint64(&gw.stats.AvgLatencyNs, totalLatencyNs/uint64(maxInt(len(workBuf), 1)))
@@ -343,7 +415,8 @@ func (gw *WireBondingGateway) logStats() {
 	sps := float64(s.SamplesRx) / maxFloat(uptime.Seconds(), 1e-9)
 	gw.logger.Printf(
 		"STATS uptime=%s frames_rx=%d (%.1f/s) samples=%d (%.1f/s) ready=%d anom=%d parse_err=%d "+
-			"avg_lat=%.3fus max_lat=%.3fus cap_drop=%d ring_enq_fail=%d ring_deq_fail=%d",
+			"avg_lat=%.3fus max_lat=%.3fus cap_drop=%d ring_enq_fail=%d ring_deq_fail=%d "+
+			"pull_pred=%d pull_redline=%d can_fuse=%d",
 		uptime.Round(100*time.Millisecond),
 		s.FramesRx, fps,
 		s.SamplesRx, sps,
@@ -352,6 +425,7 @@ func (gw *WireBondingGateway) logStats() {
 		float64(s.MaxLatencyNs)/1e3,
 		capStats.DropPackets,
 		s.RingEnqFails, s.RingDeqFails,
+		s.PullPredictions, s.PullRedlineHits, s.CANFuseFrames,
 	)
 }
 
@@ -364,18 +438,21 @@ func (gw *WireBondingGateway) GetStats() Stats {
 		avgLatency = atomic.LoadUint64(&gw.stats.AvgLatencyNs) / framesReady
 	}
 	return Stats{
-		FramesRx:      atomic.LoadUint64(&gw.stats.FramesRx),
-		FramesDropped: atomic.LoadUint64(&gw.stats.FramesDropped),
-		BytesRx:       atomic.LoadUint64(&gw.stats.BytesRx),
-		SamplesRx:     atomic.LoadUint64(&gw.stats.SamplesRx),
-		FramesReady:   framesReady,
-		Anomalies:     anomalies,
-		ParseErrors:   atomic.LoadUint64(&gw.stats.ParseErrors),
-		AvgLatencyNs:  avgLatency,
-		MaxLatencyNs:  atomic.LoadUint64(&gw.stats.MaxLatencyNs),
-		UptimeNs:      uint64(uptime),
-		RingEnqFails:  atomic.LoadUint64(&gw.stats.RingEnqFails),
-		RingDeqFails:  atomic.LoadUint64(&gw.stats.RingDeqFails),
+		FramesRx:        atomic.LoadUint64(&gw.stats.FramesRx),
+		FramesDropped:   atomic.LoadUint64(&gw.stats.FramesDropped),
+		BytesRx:         atomic.LoadUint64(&gw.stats.BytesRx),
+		SamplesRx:       atomic.LoadUint64(&gw.stats.SamplesRx),
+		FramesReady:     framesReady,
+		Anomalies:       anomalies,
+		ParseErrors:     atomic.LoadUint64(&gw.stats.ParseErrors),
+		AvgLatencyNs:    avgLatency,
+		MaxLatencyNs:    atomic.LoadUint64(&gw.stats.MaxLatencyNs),
+		UptimeNs:        uint64(uptime),
+		RingEnqFails:    atomic.LoadUint64(&gw.stats.RingEnqFails),
+		RingDeqFails:    atomic.LoadUint64(&gw.stats.RingDeqFails),
+		PullPredictions: atomic.LoadUint64(&gw.stats.PullPredictions),
+		PullRedlineHits: atomic.LoadUint64(&gw.stats.PullRedlineHits),
+		CANFuseFrames:   atomic.LoadUint64(&gw.stats.CANFuseFrames),
 	}
 }
 
@@ -400,11 +477,21 @@ func (gw *WireBondingGateway) RecentAnomalies(count int) []impedance.AnomalyEven
 	return gw.pipeline.RecentAnomalies(count)
 }
 
+func (gw *WireBondingGateway) RecentPullEvents(count int) []pullstrength.PullEvent {
+	return gw.pipeline.RecentPullEvents(count)
+}
+
+func (gw *WireBondingGateway) PullPrediction() (pullstrength.PullStrengthPrediction, bool) {
+	return gw.pipeline.PullPrediction()
+}
+
 func (gw *WireBondingGateway) Pipeline() *impedance.Pipeline { return gw.pipeline }
 func (gw *WireBondingGateway) SetJumpThreshold(pct float64)  { gw.pipeline.SetJumpThreshold(pct) }
 func (gw *WireBondingGateway) SetPhaseThreshold(deg float64) { gw.pipeline.SetPhaseThreshold(deg) }
+func (gw *WireBondingGateway) SetPullRedline(grams float64)  { gw.pipeline.SetPullRedline(grams) }
 func (gw *WireBondingGateway) FrameRing() *ringbuf.BatchRingBuffer[frameMsg] { return gw.frameRing }
 func (gw *WireBondingGateway) SampleRing() *ringbuf.BatchRingBuffer[sampleMsg] { return gw.sampRing }
+func (gw *WireBondingGateway) FuseDispatcher() *canbus.FuseDispatcher { return gw.fuse }
 
 func minInt(a, b int) int {
 	if a < b {

@@ -10,8 +10,10 @@ import (
 	"syscall"
 	"time"
 
+	"wirebonding/ultra/internal/canbus"
 	"wirebonding/ultra/internal/gateway"
 	"wirebonding/ultra/internal/impedance"
+	"wirebonding/ultra/internal/pullstrength"
 )
 
 func main() {
@@ -32,8 +34,11 @@ func main() {
 		logPath   = flag.String("log", "", "gateway log file path (default stdout)")
 		snapshot  = flag.Int("snapshot", 0, "print last N impedance rows on shutdown")
 		anomDump  = flag.Int("anom", 0, "print last N anomalies on shutdown")
+		pullDump  = flag.Int("pull", 0, "print last N pull-strength redline events on shutdown")
+		canDump   = flag.Bool("can-dump", false, "dump CAN fuse frames on shutdown")
 		ringCap   = flag.Int("ring", 65536, "lock-free ring buffer capacity (must be power-of-2)")
 		workers   = flag.Int("workers", 64, "concurrent bonding machine worker count")
+		redline   = flag.Float64("redline", 5.0, "pull-strength safety threshold in grams (redline)")
 	)
 	flag.Parse()
 
@@ -51,6 +56,7 @@ func main() {
 	cfg.LogPath = *logPath
 	cfg.RingCap = *ringCap
 	cfg.WorkerCount = *workers
+	cfg.PullRedlineG = *redline
 
 	ctx, cancel := context.WithCancel(context.Background())
 	if *duration > 0 {
@@ -84,6 +90,18 @@ func main() {
 		anomCount++
 	})
 
+	pullCount := uint64(0)
+	gw.OnPullEvent(func(p pullstrength.PullEvent) {
+		pullCount++
+	})
+
+	canCount := uint64(0)
+	var lastCAN canbus.Frame20B
+	gw.OnCANFrame(func(f canbus.Frame20B) {
+		canCount++
+		lastCAN = f
+	})
+
 	fmt.Println("=== Wire Bonding Ultra - Realtime Impedance Gateway ===")
 	fmt.Printf("  Interface : %s\n", *iface)
 	fmt.Printf("  Channel   : %s\n", *channel)
@@ -92,6 +110,7 @@ func main() {
 	fmt.Printf("  Thresholds: %.2f%% jump / %.2f° phase\n", *threshold, *phaseDeg)
 	fmt.Printf("  Ring Buffer : %d slots (tagged-CAS lock-free)\n", *ringCap)
 	fmt.Printf("  Workers    : %d concurrent bonding machines\n", *workers)
+	fmt.Printf("  Pull Redline: %.2f grams (CAN fuse threshold)\n", *redline)
 	fmt.Println()
 	fmt.Println("Press Ctrl+C to stop.")
 	fmt.Println()
@@ -117,6 +136,9 @@ func main() {
 	fmt.Printf("  Ring Enq Fail : %d (backpressure drops)\n", s.RingEnqFails)
 	fmt.Printf("  Ring Deq Fail : %d\n", s.RingDeqFails)
 	fmt.Printf("  Frames Dropped: %d\n", s.FramesDropped)
+	fmt.Printf("  Pull Preds    : %d\n", s.PullPredictions)
+	fmt.Printf("  Pull Redline  : %d events (<%.2fg)\n", s.PullRedlineHits, *redline)
+	fmt.Printf("  CAN Fuse Frames: %d (emergency stops dispatched)\n", s.CANFuseFrames)
 
 	if *snapshot > 0 {
 		fmt.Println()
@@ -161,6 +183,58 @@ func main() {
 					lenComplex(a.ZBaseline), lenComplex(a.ZMeasured))
 			}
 		}
+	}
+
+	if *pullDump > 0 {
+		evts := gw.RecentPullEvents(*pullDump)
+		if len(evts) > 0 {
+			fmt.Println()
+			fmt.Printf("=== Pull-Strength Redline Events (last %d) ===\n", len(evts))
+			for i, e := range evts {
+				if e.EventID == 0 {
+					continue
+				}
+				fmt.Printf("  #%d  id=%d seq=%d | pull=%.3fg shear=%.3fg conf=%.0f%% soft=%.1f%% diss=%.4fJ\n",
+					i+1, e.EventID, e.Prediction.SeqNo,
+					e.Prediction.PullGrams, e.Prediction.ShearGrams,
+					e.Prediction.Confidence*100,
+					e.Prediction.Features.SofteningDeg*100,
+					e.Prediction.Features.DissipationJ)
+			}
+		}
+	}
+
+	if *canDump && canCount > 0 {
+		fmt.Println()
+		fmt.Printf("=== Last CAN Fuse Frame ===\n")
+		pri, dev, cmd, reason, seq := canbus.UnpackCanID(lastCAN.ID)
+		payload := lastCAN.PayloadDecode()
+		fmt.Printf("  ID       : 0x%08X\n", lastCAN.ID)
+		fmt.Printf("  Priority : %d (0=Emergency)\n", pri)
+		fmt.Printf("  Device   : %d\n", dev)
+		fmt.Printf("  Command  : 0x%02X", cmd)
+		switch cmd {
+		case canbus.CmdBondingEmergencyStop:
+			fmt.Print(" (EMERGENCY_STOP)")
+		case canbus.CmdQualityFailStop:
+			fmt.Print(" (QUALITY_FAIL_STOP)")
+		}
+		fmt.Println()
+		fmt.Printf("  Reason   : 0x%02X", reason)
+		switch reason {
+		case canbus.ReasonPullStrengthBelowRedline:
+			fmt.Print(" (PULL_BELOW_REDLINE)")
+		case canbus.ReasonImpedanceAnomaly:
+			fmt.Print(" (IMPEDANCE_ANOMALY)")
+		}
+		fmt.Println()
+		fmt.Printf("  Seq      : %d\n", seq)
+		fmt.Printf("  DLC      : %d\n", lastCAN.DLC)
+		fmt.Printf("  Data     : % X\n", lastCAN.Data[:lastCAN.DLC])
+		fmt.Printf("  BondID   : %d\n", payload.BondID)
+		fmt.Printf("  Pull(g)  : %.2fg\n", payload.PullGrams)
+		fmt.Printf("  Dev%%     : %.2f%%\n", payload.DeviationPct)
+		fmt.Printf("  Emergency: %v\n", payload.EmergencyStop)
 	}
 
 	if err != nil && err != context.Canceled && err != context.DeadlineExceeded {
