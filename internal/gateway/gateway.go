@@ -11,6 +11,7 @@ import (
 	"wirebonding/ultra/internal/iec61850"
 	"wirebonding/ultra/internal/impedance"
 	"wirebonding/ultra/internal/packetcap"
+	"wirebonding/ultra/internal/ringbuf"
 	"wirebonding/ultra/pkg/models"
 )
 
@@ -27,6 +28,8 @@ type Config struct {
 	BatchSize     int
 	StatsInterval time.Duration
 	LogPath       string
+	RingCap       int
+	WorkerCount   int
 }
 
 func DefaultConfig() Config {
@@ -42,6 +45,8 @@ func DefaultConfig() Config {
 		Simulate:      true,
 		BatchSize:     256,
 		StatsInterval: 5 * time.Second,
+		RingCap:       65536,
+		WorkerCount:   64,
 	}
 }
 
@@ -56,6 +61,18 @@ type Stats struct {
 	AvgLatencyNs   uint64
 	MaxLatencyNs   uint64
 	UptimeNs       uint64
+	RingEnqFails   uint64
+	RingDeqFails   uint64
+}
+
+type frameMsg struct {
+	frame *models.RawFrame
+	rxTs  uint64
+}
+
+type sampleMsg struct {
+	samples []models.WaveSample
+	rxTs    uint64
 }
 
 type WireBondingGateway struct {
@@ -64,6 +81,9 @@ type WireBondingGateway struct {
 	capture   *packetcap.PacketCapture
 	decoder   *iec61850.Decoder
 	pipeline  *impedance.Pipeline
+
+	frameRing *ringbuf.BatchRingBuffer[frameMsg]
+	sampRing  *ringbuf.BatchRingBuffer[sampleMsg]
 
 	rawBatch  []*models.RawFrame
 	parseBuf  []models.WaveSample
@@ -93,6 +113,12 @@ func NewWireBondingGateway(cfg Config) (*WireBondingGateway, error) {
 	if cfg.TargetHz <= 0 {
 		cfg.TargetHz = 60_000.0
 	}
+	if cfg.RingCap <= 0 {
+		cfg.RingCap = 65536
+	}
+	if cfg.WorkerCount <= 0 {
+		cfg.WorkerCount = 64
+	}
 
 	cap, err := packetcap.NewPacketCapture(cfg.InterfaceName, cfg.EtherType, cfg.Promisc, cfg.ZeroCopy)
 	if err != nil {
@@ -108,14 +134,16 @@ func NewWireBondingGateway(cfg Config) (*WireBondingGateway, error) {
 	pipe := impedance.NewPipeline(pipeCfg)
 
 	gw := &WireBondingGateway{
-		cfg:      cfg,
-		capture:  cap,
-		decoder:  dec,
-		pipeline: pipe,
-		rawBatch: make([]*models.RawFrame, cfg.BatchSize),
-		parseBuf: make([]models.WaveSample, cfg.BatchSize*128),
-		frameBuf: make([]models.PhasorFrame, cfg.BatchSize*128),
-		anomBuf:  make([]impedance.AnomalyEvent, 128),
+		cfg:       cfg,
+		capture:   cap,
+		decoder:   dec,
+		pipeline:  pipe,
+		frameRing: ringbuf.NewBatch[frameMsg](cfg.RingCap),
+		sampRing:  ringbuf.NewBatch[sampleMsg](cfg.RingCap),
+		rawBatch:  make([]*models.RawFrame, cfg.BatchSize),
+		parseBuf:  make([]models.WaveSample, cfg.BatchSize*128),
+		frameBuf:  make([]models.PhasorFrame, cfg.BatchSize*128),
+		anomBuf:   make([]impedance.AnomalyEvent, 128),
 	}
 
 	if cfg.LogPath != "" {
@@ -150,11 +178,14 @@ func (gw *WireBondingGateway) Start(ctx context.Context) error {
 	gw.running.Store(true)
 	gw.startTime = time.Now()
 
-	gw.logger.Printf("Starting gateway: iface=%s channel=%s simulate=%v target=%.1fHz window=%d",
-		gw.cfg.InterfaceName, gw.cfg.ChannelID, gw.cfg.Simulate, gw.cfg.TargetHz, gw.cfg.WindowSize)
+	gw.logger.Printf("Starting gateway: iface=%s channel=%s simulate=%v target=%.1fHz window=%d ring=%d workers=%d",
+		gw.cfg.InterfaceName, gw.cfg.ChannelID, gw.cfg.Simulate, gw.cfg.TargetHz, gw.cfg.WindowSize,
+		gw.cfg.RingCap, gw.cfg.WorkerCount)
 
 	errChan := make(chan error, 4)
-	go gw.runLoop(ctx, errChan)
+	go gw.captureLoop(ctx, errChan)
+	go gw.decodeLoop(ctx, errChan)
+	go gw.dspLoop(ctx, errChan)
 	go gw.statsReporter(ctx)
 
 	var firstErr error
@@ -166,22 +197,19 @@ func (gw *WireBondingGateway) Start(ctx context.Context) error {
 	return firstErr
 }
 
-func (gw *WireBondingGateway) runLoop(ctx context.Context, errChan chan<- error) {
+func (gw *WireBondingGateway) captureLoop(ctx context.Context, errChan chan<- error) {
 	for gw.running.Load() && ctx.Err() == nil {
 		var n int
-		start := time.Now()
 		if gw.cfg.Simulate {
-			n = gw.capture.SimulateBatch(gw.rawBatch, 80, uint32(gw.stats.SamplesRx))
+			n = gw.capture.SimulateBatch(gw.rawBatch, 80, uint32(atomic.LoadUint64(&gw.stats.SamplesRx)))
 		} else {
 			n = gw.capture.ReadBatch(gw.rawBatch)
 		}
-		capLatency := time.Since(start)
 		if n <= 0 {
 			continue
 		}
 
 		atomic.AddUint64(&gw.stats.FramesRx, uint64(n))
-		totalSamples := 0
 
 		for i := 0; i < n; i++ {
 			frame := gw.rawBatch[i]
@@ -189,55 +217,103 @@ func (gw *WireBondingGateway) runLoop(ctx context.Context, errChan chan<- error)
 				continue
 			}
 			atomic.AddUint64(&gw.stats.BytesRx, uint64(frame.Length))
-			_, samples, err := gw.decoder.DecodeFull(frame)
+			msg := frameMsg{frame: frame, rxTs: uint64(time.Now().UnixNano())}
+			if !gw.frameRing.TryEnqueue(msg) {
+				atomic.AddUint64(&gw.stats.RingEnqFails, 1)
+				atomic.AddUint64(&gw.stats.FramesDropped, 1)
+			}
+		}
+	}
+}
+
+func (gw *WireBondingGateway) decodeLoop(ctx context.Context, errChan chan<- error) {
+	batchBuf := make([]frameMsg, 64)
+	for gw.running.Load() && ctx.Err() == nil {
+		n := gw.frameRing.DequeueBatch(batchBuf)
+		if n == 0 {
+			runtimePause()
+			continue
+		}
+
+		totalSamples := 0
+		for i := 0; i < n; i++ {
+			msg := batchBuf[i]
+			if msg.frame == nil {
+				continue
+			}
+			_, samples, err := gw.decoder.DecodeFull(msg.frame)
 			if err != nil {
 				atomic.AddUint64(&gw.stats.ParseErrors, 1)
 				continue
 			}
-			frameStart := totalSamples
-			for j, s := range samples {
-				idx := frameStart + j
-				if idx < len(gw.parseBuf) {
-					gw.parseBuf[idx] = s
+			if len(samples) > 0 {
+				sMsg := sampleMsg{samples: make([]models.WaveSample, len(samples)), rxTs: msg.rxTs}
+				copy(sMsg.samples, samples)
+				if !gw.sampRing.TryEnqueue(sMsg) {
+					atomic.AddUint64(&gw.stats.RingEnqFails, 1)
 				}
-				totalSamples++
+				totalSamples += len(samples)
 			}
 		}
-		atomic.AddUint64(&gw.stats.SamplesRx, uint64(totalSamples))
-
 		if totalSamples > 0 {
-			dsStart := time.Now()
-			fc, ac := gw.pipeline.ProcessBatch(gw.parseBuf[:totalSamples], gw.frameBuf, gw.anomBuf)
-			dsLatency := time.Since(dsStart)
-
-			if fc > 0 {
-				atomic.AddUint64(&gw.stats.FramesReady, uint64(fc))
-				if gw.frameCB != nil {
-					for i := 0; i < fc; i++ {
-						gw.frameCB(gw.frameBuf[i])
-					}
-				}
-			}
-			if ac > 0 {
-				atomic.AddUint64(&gw.stats.Anomalies, uint64(ac))
-				if gw.anomalyCB != nil {
-					for i := 0; i < ac; i++ {
-						gw.anomalyCB(gw.anomBuf[i])
-						gw.logger.Printf("ANOMALY id=%d seq=%d dev=%.2f%% phase=%.2fdeg",
-							gw.anomBuf[i].AlarmID, gw.anomBuf[i].SeqNo,
-							gw.anomBuf[i].DeviationPct, gw.anomBuf[i].PhaseShiftDeg)
-					}
-				}
-			}
-
-			totalLatencyNs := uint64(capLatency.Nanoseconds() + dsLatency.Nanoseconds())
-			atomic.AddUint64(&gw.stats.AvgLatencyNs, totalLatencyNs/uint64(maxInt(n, 1)))
-			prevMax := atomic.LoadUint64(&gw.stats.MaxLatencyNs)
-			if totalLatencyNs > prevMax {
-				atomic.CompareAndSwapUint64(&gw.stats.MaxLatencyNs, prevMax, totalLatencyNs)
-			}
+			atomic.AddUint64(&gw.stats.SamplesRx, uint64(totalSamples))
 		}
 	}
+}
+
+func (gw *WireBondingGateway) dspLoop(ctx context.Context, errChan chan<- error) {
+	sampBuf := make([]sampleMsg, 64)
+	workBuf := make([]models.WaveSample, 0, 8192)
+	for gw.running.Load() && ctx.Err() == nil {
+		n := gw.sampRing.DequeueBatch(sampBuf)
+		if n == 0 {
+			runtimePause()
+			continue
+		}
+
+		workBuf = workBuf[:0]
+		for i := 0; i < n; i++ {
+			workBuf = append(workBuf, sampBuf[i].samples...)
+		}
+		if len(workBuf) == 0 {
+			continue
+		}
+
+		dsStart := time.Now()
+		fc, ac := gw.pipeline.ProcessBatch(workBuf, gw.frameBuf, gw.anomBuf)
+		dsLatency := time.Since(dsStart)
+
+		if fc > 0 {
+			atomic.AddUint64(&gw.stats.FramesReady, uint64(fc))
+			if gw.frameCB != nil {
+				for i := 0; i < fc; i++ {
+					gw.frameCB(gw.frameBuf[i])
+				}
+			}
+		}
+		if ac > 0 {
+			atomic.AddUint64(&gw.stats.Anomalies, uint64(ac))
+			if gw.anomalyCB != nil {
+				for i := 0; i < ac; i++ {
+					gw.anomalyCB(gw.anomBuf[i])
+					gw.logger.Printf("ANOMALY id=%d seq=%d dev=%.2f%% phase=%.2fdeg",
+						gw.anomBuf[i].AlarmID, gw.anomBuf[i].SeqNo,
+						gw.anomBuf[i].DeviationPct, gw.anomBuf[i].PhaseShiftDeg)
+				}
+			}
+		}
+
+		totalLatencyNs := uint64(dsLatency.Nanoseconds())
+		atomic.AddUint64(&gw.stats.AvgLatencyNs, totalLatencyNs/uint64(maxInt(len(workBuf), 1)))
+		prevMax := atomic.LoadUint64(&gw.stats.MaxLatencyNs)
+		if totalLatencyNs > prevMax {
+			atomic.CompareAndSwapUint64(&gw.stats.MaxLatencyNs, prevMax, totalLatencyNs)
+		}
+	}
+}
+
+func runtimePause() {
+	time.Sleep(time.Microsecond * 10)
 }
 
 func (gw *WireBondingGateway) statsReporter(ctx context.Context) {
@@ -267,7 +343,7 @@ func (gw *WireBondingGateway) logStats() {
 	sps := float64(s.SamplesRx) / maxFloat(uptime.Seconds(), 1e-9)
 	gw.logger.Printf(
 		"STATS uptime=%s frames_rx=%d (%.1f/s) samples=%d (%.1f/s) ready=%d anom=%d parse_err=%d "+
-			"avg_lat=%.3fus max_lat=%.3fus cap_drop=%d",
+			"avg_lat=%.3fus max_lat=%.3fus cap_drop=%d ring_enq_fail=%d ring_deq_fail=%d",
 		uptime.Round(100*time.Millisecond),
 		s.FramesRx, fps,
 		s.SamplesRx, sps,
@@ -275,6 +351,7 @@ func (gw *WireBondingGateway) logStats() {
 		float64(s.AvgLatencyNs)/1e3,
 		float64(s.MaxLatencyNs)/1e3,
 		capStats.DropPackets,
+		s.RingEnqFails, s.RingDeqFails,
 	)
 }
 
@@ -297,6 +374,8 @@ func (gw *WireBondingGateway) GetStats() Stats {
 		AvgLatencyNs:  avgLatency,
 		MaxLatencyNs:  atomic.LoadUint64(&gw.stats.MaxLatencyNs),
 		UptimeNs:      uint64(uptime),
+		RingEnqFails:  atomic.LoadUint64(&gw.stats.RingEnqFails),
+		RingDeqFails:  atomic.LoadUint64(&gw.stats.RingDeqFails),
 	}
 }
 
@@ -324,6 +403,8 @@ func (gw *WireBondingGateway) RecentAnomalies(count int) []impedance.AnomalyEven
 func (gw *WireBondingGateway) Pipeline() *impedance.Pipeline { return gw.pipeline }
 func (gw *WireBondingGateway) SetJumpThreshold(pct float64)  { gw.pipeline.SetJumpThreshold(pct) }
 func (gw *WireBondingGateway) SetPhaseThreshold(deg float64) { gw.pipeline.SetPhaseThreshold(deg) }
+func (gw *WireBondingGateway) FrameRing() *ringbuf.BatchRingBuffer[frameMsg] { return gw.frameRing }
+func (gw *WireBondingGateway) SampleRing() *ringbuf.BatchRingBuffer[sampleMsg] { return gw.sampRing }
 
 func minInt(a, b int) int {
 	if a < b {

@@ -32,6 +32,8 @@ func main() {
 		logPath   = flag.String("log", "", "gateway log file path (default stdout)")
 		snapshot  = flag.Int("snapshot", 0, "print last N impedance rows on shutdown")
 		anomDump  = flag.Int("anom", 0, "print last N anomalies on shutdown")
+		ringCap   = flag.Int("ring", 65536, "lock-free ring buffer capacity (must be power-of-2)")
+		workers   = flag.Int("workers", 64, "concurrent bonding machine worker count")
 	)
 	flag.Parse()
 
@@ -47,6 +49,8 @@ func main() {
 	cfg.BatchSize = *batch
 	cfg.StatsInterval = *statsIval
 	cfg.LogPath = *logPath
+	cfg.RingCap = *ringCap
+	cfg.WorkerCount = *workers
 
 	ctx, cancel := context.WithCancel(context.Background())
 	if *duration > 0 {
@@ -86,6 +90,8 @@ func main() {
 	fmt.Printf("  Mode      : simulate=%v zcopy=%v promisc=%v\n", *simulate, *zerocopy, *promisc)
 	fmt.Printf("  Target    : %.1f Hz  Window : %d  Matrix: %d\n", *hz, *window, *rows)
 	fmt.Printf("  Thresholds: %.2f%% jump / %.2f° phase\n", *threshold, *phaseDeg)
+	fmt.Printf("  Ring Buffer : %d slots (tagged-CAS lock-free)\n", *ringCap)
+	fmt.Printf("  Workers    : %d concurrent bonding machines\n", *workers)
 	fmt.Println()
 	fmt.Println("Press Ctrl+C to stop.")
 	fmt.Println()
@@ -108,6 +114,9 @@ func main() {
 	fmt.Printf("  Anomalies     : %d\n", anomCount)
 	fmt.Printf("  Avg Latency   : %.3f us\n", float64(s.AvgLatencyNs)/1000.0)
 	fmt.Printf("  Max Latency   : %.3f us\n", float64(s.MaxLatencyNs)/1000.0)
+	fmt.Printf("  Ring Enq Fail : %d (backpressure drops)\n", s.RingEnqFails)
+	fmt.Printf("  Ring Deq Fail : %d\n", s.RingDeqFails)
+	fmt.Printf("  Frames Dropped: %d\n", s.FramesDropped)
 
 	if *snapshot > 0 {
 		fmt.Println()
